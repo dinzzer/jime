@@ -177,10 +177,6 @@ python tools\train_nn.py corpus.txt data\nn_model.bin --counts
 効果例: 「きのうがっこうにいった」が 機能学校→**昨日学校** に、
 「はしをわたる」が わたる→**渡る** に改善。
 
-※ 京大テキストコーパス ([KyotoCorpus](https://github.com/ku-nlp/KyotoCorpus)) は
-リポジトリに原文 (表層文字列) が含まれず (毎日新聞1995 CD-ROM が必要)、
-そのままでは学習に使えない。CD-ROM から原文を復元済みの場合は
-`make_corpus_knp.py` がそのまま使える。
 
 ## 既知の制限
 
