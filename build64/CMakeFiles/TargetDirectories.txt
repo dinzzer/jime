@@ -1,0 +1,6 @@
+E:/source/jime/build64/CMakeFiles/jime_engine.dir
+E:/source/jime/build64/CMakeFiles/jime_test.dir
+E:/source/jime/build64/CMakeFiles/jime.dir
+E:/source/jime/build64/CMakeFiles/jime_config.dir
+E:/source/jime/build64/CMakeFiles/ALL_BUILD.dir
+E:/source/jime/build64/CMakeFiles/ZERO_CHECK.dir
