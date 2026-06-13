@@ -2,6 +2,8 @@
 #include "engine.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -253,6 +255,80 @@ int Rescorer::PairCost(const std::string& left, const std::string& right) const 
     return 0;
 }
 
+// ============================================================== Learning
+void LearningStore::SetPath(const std::string& path) {
+    path_ = path;
+    mtime_ = -1;
+    ReloadIfChanged();
+}
+
+bool LearningStore::ReloadIfChanged() {
+    if (path_.empty()) return false;
+    std::error_code ec;
+    auto t = std::filesystem::last_write_time(JIME_PATH(path_), ec);
+    if (ec) return false;
+    int64_t mt = (int64_t)t.time_since_epoch().count();
+    if (mt == mtime_) return false;
+    mtime_ = mt;
+    byReading_.clear();
+    std::ifstream f(JIME_PATH(path_), std::ios::binary);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t t1 = line.find('\t');
+        size_t t2 = (t1 == std::string::npos) ? std::string::npos
+                                              : line.find('\t', t1 + 1);
+        if (t1 == std::string::npos || t2 == std::string::npos) continue;
+        uint32_t count = (uint32_t)atoi(line.c_str() + t2 + 1);
+        if (count == 0) continue;
+        byReading_[line.substr(0, t1)].push_back(
+            {line.substr(t1 + 1, t2 - t1 - 1), count});
+    }
+    return true;
+}
+
+void LearningStore::Save() const {
+    if (path_.empty()) return;
+    std::ofstream f(JIME_PATH(path_), std::ios::binary | std::ios::trunc);
+    for (const auto& kv : byReading_)
+        for (const auto& e : kv.second)
+            f << kv.first << '\t' << e.first << '\t' << e.second << '\n';
+}
+
+void LearningStore::Record(const std::string& reading,
+                           const std::string& surface) {
+    ReloadIfChanged();  // 他プロセスの更新を取り込んでから加算
+    auto& vec = byReading_[reading];
+    bool found = false;
+    for (auto& e : vec) {
+        if (e.first == surface) {
+            e.second++;
+            found = true;
+            break;
+        }
+    }
+    if (!found) vec.push_back({surface, 1});
+    Save();
+    std::error_code ec;
+    auto t = std::filesystem::last_write_time(JIME_PATH(path_), ec);
+    if (!ec) mtime_ = (int64_t)t.time_since_epoch().count();
+}
+
+const std::vector<std::pair<std::string, uint32_t>>* LearningStore::Find(
+    const std::string& reading) const {
+    auto it = byReading_.find(reading);
+    return (it == byReading_.end()) ? nullptr : &it->second;
+}
+
+int LearningStore::Bonus(uint32_t count) {
+    if (count == 0) return 0;
+    // 文節分解 (起き+て vs 掟、口+が vs 甲賀 等) との競合にも勝てるよう
+    // 強めに設定。明示選択した語は次回からデフォルトになる (MS-IME 同等)。
+    double b = 2000.0 + 600.0 * std::log2((double)count);
+    if (b > 3500.0) b = 3500.0;
+    return -(int)b;
+}
+
 // ============================================================== Romaji
 // CSV 1行をパース (ダブルクォート対応)
 static std::vector<std::string> ParseCsvLine(const std::string& line) {
@@ -417,11 +493,102 @@ std::string RomajiConverter::ToRomaji(const std::string& kana) const {
 }
 
 // ============================================================== Engine
+// ---- 最小 JSON パーサ (フラットな {"key":"value",...} のみ対応) ----
+static void JsonSkipWs(const std::string& s, size_t& i) {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' ||
+                            s[i] == '\r'))
+        i++;
+}
+
+static bool JsonString(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || s[i] != '"') return false;
+    i++;
+    out.clear();
+    while (i < s.size() && s[i] != '"') {
+        char c = s[i];
+        if (c == '\\') {
+            i++;
+            if (i >= s.size()) return false;
+            char e = s[i];
+            switch (e) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'n': out += '\n'; break;
+                case 't': out += '\t'; break;
+                case 'r': out += '\r'; break;
+                case 'b': case 'f': break;
+                case 'u': {
+                    if (i + 4 >= s.size()) return false;
+                    unsigned v = (unsigned)strtoul(s.substr(i + 1, 4).c_str(),
+                                                   nullptr, 16);
+                    i += 4;
+                    // サロゲートペア
+                    if (v >= 0xD800 && v < 0xDC00 && i + 6 < s.size() &&
+                        s[i + 1] == '\\' && s[i + 2] == 'u') {
+                        unsigned lo = (unsigned)strtoul(
+                            s.substr(i + 3, 4).c_str(), nullptr, 16);
+                        if (lo >= 0xDC00 && lo < 0xE000) {
+                            v = 0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    }
+                    out += CpToUtf8(v);
+                    break;
+                }
+                default: return false;
+            }
+            i++;
+        } else {
+            out += c;
+            i++;
+        }
+    }
+    if (i >= s.size()) return false;
+    i++;
+    return true;
+}
+
+static bool ParseFlatJsonObject(
+    const std::string& text,
+    std::unordered_map<std::string, std::string>& out) {
+    size_t i = 0;
+    JsonSkipWs(text, i);
+    if (i >= text.size() || text[i] != '{') return false;
+    i++;
+    JsonSkipWs(text, i);
+    if (i < text.size() && text[i] == '}') return true;
+    while (i < text.size()) {
+        JsonSkipWs(text, i);
+        std::string k, v;
+        if (!JsonString(text, i, k)) return false;
+        JsonSkipWs(text, i);
+        if (i >= text.size() || text[i] != ':') return false;
+        i++;
+        JsonSkipWs(text, i);
+        if (!JsonString(text, i, v)) return false;
+        out[k] = v;
+        JsonSkipWs(text, i);
+        if (i < text.size() && text[i] == ',') { i++; continue; }
+        if (i < text.size() && text[i] == '}') return true;
+        return false;
+    }
+    return false;
+}
+
 bool Engine::Load(const std::string& dataDir, const std::string& kanaCsvPath) {
     if (!dict_.Load(dataDir + "/system.dic")) return false;
     if (!conn_.Load(dataDir + "/connection.bin")) return false;
     if (!romaji_.Load(kanaCsvPath)) return false;
     rescorer_.Load(dataDir + "/nn_model.bin");  // 任意 (失敗可)
+    // LaTeX 記号表 (任意)
+    std::vector<uint8_t> buf;
+    if (ReadFile(dataDir + "/latex_symbols.json", buf)) {
+        std::string text((const char*)buf.data(), buf.size());
+        if (text.size() >= 3 && (unsigned char)text[0] == 0xEF)
+            text = text.substr(3);  // BOM
+        ParseFlatJsonObject(text, latexMap_);
+    }
     return true;
 }
 
@@ -516,8 +683,19 @@ void Engine::BuildNodes(const std::vector<std::string>& kana,
                     byBegin[b].push_back(std::move(nd));
                 }
             }
+            // 学習エントリ (この読みで過去に選択された表層)
+            const auto* learned = learning_.Find(key);
+            std::vector<bool> learnedCovered;
+            if (learned) learnedCovered.assign(learned->size(), false);
+
             uint32_t eb, ee;
+            int minCost = 32767;  // 同一読みの最安コスト (エントリはコスト昇順)
             if (dict_.Lookup(key.data(), key.size(), eb, ee)) {
+                {
+                    uint16_t l0, r0; int16_t c0;
+                    dict_.Entry(eb, l0, r0, c0);
+                    minCost = c0;
+                }
                 uint32_t count = std::min<uint32_t>(ee - eb, kMaxEntriesPerReading);
                 for (uint32_t i = 0; i < count; i++) {
                     Node nd;
@@ -527,6 +705,40 @@ void Engine::BuildNodes(const std::vector<std::string>& kana,
                     nd.reading = key;
                     nd.punct = (l == 1 && IsPunctCp(kana[b]));
                     nd.functional = dict_.IsFunctional(nd.lid) || nd.punct;
+                    if (learned) {
+                        for (size_t li = 0; li < learned->size(); li++) {
+                            if ((*learned)[li].first == nd.surface) {
+                                // 同一読みの最安語より確実に安くする
+                                // (明示選択は即デフォルト化。回数で深さ増加)
+                                uint32_t cnt = (*learned)[li].second;
+                                int v = std::min(
+                                    nd.wcost + LearningStore::Bonus(cnt),
+                                    minCost - 500 -
+                                        50 * (int)std::min(cnt, 10u));
+                                nd.wcost = (int16_t)std::max(v, -30000);
+                                nd.learned = true;
+                                learnedCovered[li] = true;
+                                break;
+                            }
+                        }
+                    }
+                    byBegin[b].push_back(std::move(nd));
+                }
+            }
+            // 辞書に無い学習表層 (カタカナ形等) は合成ノードで追加
+            if (learned) {
+                for (size_t li = 0; li < learned->size(); li++) {
+                    if (learnedCovered[li]) continue;
+                    Node nd;
+                    nd.begin = b; nd.end = b + l;
+                    nd.surface = (*learned)[li].first;
+                    nd.reading = key;
+                    nd.lid = nd.rid = kGenericNounId;
+                    int base = std::min(
+                        4000 + LearningStore::Bonus((*learned)[li].second),
+                        minCost - 500);
+                    nd.wcost = (int16_t)std::max(base, -30000);
+                    nd.learned = true;
                     byBegin[b].push_back(std::move(nd));
                 }
             }
@@ -580,7 +792,13 @@ std::vector<Segment> Engine::Decode(const std::vector<std::string>& kana,
                     const Node& pv = all[pi];
                     if (pv.total >= kInf) continue;
                     int64_t c = pv.total + conn_.Cost(pv.rid, nd.lid);
-                    if (useNN) c += rescorer_.PairCost(pv.surface, nd.surface);
+                    if (useNN) {
+                        int rc = rescorer_.PairCost(pv.surface, nd.surface);
+                        // 学習語に接する境界は補正を減衰させ、
+                        // コーパス文脈がユーザーの明示選択を打ち消さないようにする
+                        if (pv.learned || nd.learned) rc /= 2;
+                        c += rc;
+                    }
                     if (c < best) { best = c; bestPrev = pi; }
                 }
             }
@@ -644,6 +862,9 @@ std::vector<Candidate> Engine::Candidates(const std::vector<std::string>& kana,
         for (const auto& surf : uit->second)
             scored.push_back({rank++, {surf, kGenericNounId, kGenericNounId}});
     }
+    const auto* learned = learning_.Find(key);
+    std::vector<bool> learnedCovered;
+    if (learned) learnedCovered.assign(learned->size(), false);
 
     uint32_t eb, ee;
     if (dict_.Lookup(key.data(), key.size(), eb, ee)) {
@@ -654,7 +875,26 @@ std::vector<Candidate> Engine::Candidates(const std::vector<std::string>& kana,
             c.surface = dict_.Surface(i);
             int64_t score = (int64_t)wcost + conn_.Cost(prevRid, c.lid) +
                             conn_.Cost(c.rid, nextLid);
+            if (learned) {
+                for (size_t li = 0; li < learned->size(); li++) {
+                    if ((*learned)[li].first == c.surface) {
+                        // ユーザー辞書 (-1000000) の次に、回数順で上位固定
+                        score = -800000 - (int64_t)(*learned)[li].second;
+                        learnedCovered[li] = true;
+                        break;
+                    }
+                }
+            }
             scored.push_back({score, std::move(c)});
+        }
+    }
+    // 辞書外の学習表層も学習回数順で上位に
+    if (learned) {
+        for (size_t li = 0; li < learned->size(); li++) {
+            if (learnedCovered[li]) continue;
+            scored.push_back(
+                {-800000 - (int64_t)(*learned)[li].second,
+                 {(*learned)[li].first, kGenericNounId, kGenericNounId}});
         }
     }
     std::stable_sort(scored.begin(), scored.end(),
@@ -664,16 +904,23 @@ std::vector<Candidate> Engine::Candidates(const std::vector<std::string>& kana,
     std::unordered_set<std::string> seen;
     for (auto& sc : scored) {
         if (seen.insert(sc.second.surface).second) {
+            sc.second.score = sc.first;
             out.push_back(std::move(sc.second));
             if ((int)out.size() >= maxCount - 2) break;
         }
     }
-    // ひらがな / カタカナ
-    if (!seen.count(key))
-        out.push_back({key, kGenericNounId, kGenericNounId});
+    // ひらがな / カタカナ (常に末尾側)
+    if (!seen.count(key)) {
+        Candidate c{key, kGenericNounId, kGenericNounId};
+        c.score = 900000;
+        out.push_back(std::move(c));
+    }
     std::string kata = HiraToKata(key);
-    if (kata != key && !seen.count(kata))
-        out.push_back({kata, kGenericNounId, kGenericNounId});
+    if (kata != key && !seen.count(kata)) {
+        Candidate c{kata, kGenericNounId, kGenericNounId};
+        c.score = 900001;
+        out.push_back(std::move(c));
+    }
     return out;
 }
 
@@ -713,13 +960,15 @@ void LiveSession::AutoCommit(std::string& out) {
     int cutKana = segments_[cutSeg - 1].end;
     for (int i = 0; i < cutSeg; i++) out += segments_[i].surface;
     kana_.erase(kana_.begin(), kana_.begin() + cutKana);
-    // ピンの平行移動 / 破棄
+    // ピンの平行移動 / 破棄 (確定されたピンは学習に記録)
     std::vector<Pin> kept;
     for (auto& p : pins_) {
         if (p.begin >= cutKana) {
             p.begin -= cutKana;
             p.end -= cutKana;
             kept.push_back(p);
+        } else if (p.end <= cutKana) {
+            engine_.RecordSelection(p.learnReading, p.learnSurface);
         }
     }
     pins_.swap(kept);
@@ -752,21 +1001,84 @@ SessionResult LiveSession::Refresh(std::string commitPrefix) {
         r.composition += (*disp)[i].surface;
         r.segmentSpans.push_back({from, (int)r.composition.size()});
     }
+    if (latexActive_) {  // LaTeX トークンは生表示 (\sig...)
+        int from = (int)r.composition.size();
+        r.composition += "\\" + latexToken_;
+        r.segmentSpans.push_back({from, (int)r.composition.size()});
+    }
     if (focus_ >= (int)segments_.size()) focus_ = (int)segments_.size() - 1;
     r.focusedSegment = (focus_ < (int)disp->size()) ? focus_ : -1;
     return r;
 }
 
+// 記号の全角化 ([→「 ]→」、その他 ASCII 記号→全角形)。英数字は対象外。
+static std::string SymbolsToZenkaku(const std::string& s) {
+    std::string out;
+    for (auto& cp : Utf8Split(s)) {
+        if (cp.size() == 1) {
+            unsigned char c = (unsigned char)cp[0];
+            if (c == '[') { out += "\xE3\x80\x8C"; continue; }  // 「
+            if (c == ']') { out += "\xE3\x80\x8D"; continue; }  // 」
+            if (c > 0x20 && c < 0x7F && !isalnum(c)) {
+                out += CpToUtf8(c + 0xFEE0);
+                continue;
+            }
+        }
+        out += cp;
+    }
+    return out;
+}
+
+void LiveSession::FinishLatex(bool convert) {
+    latexActive_ = false;
+    const std::string* sym =
+        (convert && !latexToken_.empty()) ? engine_.LatexLookup(latexToken_)
+                                          : nullptr;
+    std::string text = sym ? *sym : ("\\" + latexToken_);  // 不一致はリテラル
+    for (auto& cp : Utf8Split(text)) kana_.push_back(cp);
+    latexToken_.clear();
+}
+
+SessionResult LiveSession::ConvertLatexToken() {
+    if (!latexActive_) { SessionResult r; r.consumed = false; return r; }
+    FinishLatex(true);
+    return Refresh();
+}
+
 SessionResult LiveSession::InputChar(char c) {
+    if (latexActive_) {
+        if (isalpha((unsigned char)c)) {
+            latexToken_ += c;
+            return Refresh();
+        }
+        // 非英字: mode 1=自動変換してから通常入力, mode 2=トークン中断(変換しない)
+        FinishLatex(latexMode_ == 1);
+        // fall through to normal char processing
+    }
+    // \ で LaTeX モード開始
+    if (c == '\\' && latexMode_ != 0 && engine_.LatexAvailable()) {
+        latexActive_ = true;
+        latexToken_.clear();
+        return Refresh();
+    }
     ResetFocus();
     std::string kanaOut;
     engine_.Romaji().Feed(c, pendingRomaji_, kanaOut);
+    if (fullWidthSymbols_) kanaOut = SymbolsToZenkaku(kanaOut);
     for (auto& cp : Utf8Split(kanaOut)) kana_.push_back(cp);
     return Refresh();
 }
 
 SessionResult LiveSession::Backspace() {
     ResetFocus();
+    if (latexActive_) {
+        if (!latexToken_.empty()) {
+            latexToken_.pop_back();
+            return Refresh();
+        }
+        latexActive_ = false;  // \ だけ残っていた状態 → LaTeX モード解除
+        return Refresh();
+    }
     SessionResult r;
     if (!pendingRomaji_.empty()) {
         pendingRomaji_.pop_back();
@@ -791,18 +1103,27 @@ SessionResult LiveSession::CommitAll() {
         pendingRomaji_.clear();
         pins_.clear();
         segments_.clear();
+        latexActive_ = false;
+        latexToken_.clear();
         ResetFocus();
         return r;
     }
+    // LaTeX トークンが残っていれば確定 (mode 0 ならリテラル、それ以外は変換)
+    if (latexActive_) FinishLatex(latexMode_ != 0);
     std::string flushed = engine_.Romaji().Flush(pendingRomaji_);
     for (auto& cp : Utf8Split(flushed)) kana_.push_back(cp);
     segments_ = engine_.Decode(kana_, pins_);
     SessionResult r;
     for (auto& s : segments_) r.commitText += s.surface;
+    // 残っているピンを全て学習記録
+    for (auto& p : pins_)
+        engine_.RecordSelection(p.learnReading, p.learnSurface);
     kana_.clear();
     pendingRomaji_.clear();
     pins_.clear();
     segments_.clear();
+    latexActive_ = false;
+    latexToken_.clear();
     ResetFocus();
     return r;
 }
@@ -812,6 +1133,8 @@ SessionResult LiveSession::Clear() {
     pendingRomaji_.clear();
     pins_.clear();
     segments_.clear();
+    latexActive_ = false;
+    latexToken_.clear();
     ResetFocus();
     return SessionResult();
 }
@@ -819,7 +1142,7 @@ SessionResult LiveSession::Clear() {
 SessionResult LiveSession::MoveFocus(int delta) {
     CloseCandidates();
     fnMode_ = 0;
-    FlushPendingToKana();  // 表示と区切りを一致させる (n→ん 等を確定)
+    FlushPendingToKana();
     if (segments_.empty()) { SessionResult r; r.consumed = false; return r; }
     if (focus_ < 0) focus_ = (int)segments_.size() - 1;
     focus_ = std::max(0, std::min((int)segments_.size() - 1, focus_ + delta));
@@ -828,45 +1151,92 @@ SessionResult LiveSession::MoveFocus(int delta) {
 
 SessionResult LiveSession::NextCandidate(int delta) {
     fnMode_ = 0;
-    if (!candOpen_) FlushPendingToKana();  // 表示と区切りを一致させる
+    if (!candOpen_) FlushPendingToKana();
     if (segments_.empty()) { SessionResult r; r.consumed = false; return r; }
     if (focus_ < 0) focus_ = (int)segments_.size() - 1;
-    const Segment& seg = segments_[focus_];
 
-    // 自立語部分のみ候補列挙し、付属語 (tail) はそのまま連結する
-    int cBegin = seg.begin;
-    int cEnd = (seg.contentEnd > seg.begin && seg.contentEnd <= seg.end)
-                   ? seg.contentEnd : seg.end;
-    bool hasTail = cEnd < seg.end;
     if (!candOpen_) {
+        // 初回オープン: 文節構造を保存 (再デコード後も元のスパンを参照するため)
+        const Segment& seg = segments_[focus_];
+        candSegBegin_   = seg.begin;
+        candSegEnd_     = seg.end;
+        candContentEnd_ = (seg.contentEnd > seg.begin && seg.contentEnd <= seg.end)
+                              ? seg.contentEnd : seg.end;
+        candTailRid_    = seg.rid;
+        candTailSurface_ = seg.tailSurface;
+
         uint16_t prevRid = (focus_ > 0) ? segments_[focus_ - 1].rid : 0;
+        bool hasTail = candContentEnd_ < candSegEnd_;
         uint16_t nextLid = hasTail ? seg.tailLid
                            : (focus_ + 1 < (int)segments_.size())
                                ? segments_[focus_ + 1].lid : 0;
+
+        // (A) 自立語スパン候補 (こう → 甲、公、...)
         candidatesFull_ =
-            engine_.Candidates(kana_, cBegin, cEnd, prevRid, nextLid);
-        candidates_.clear();
-        candIndex_ = 0;
-        for (int i = 0; i < (int)candidatesFull_.size(); i++) {
-            candidates_.push_back(candidatesFull_[i].surface + seg.tailSurface);
-            if (candidates_.back() == seg.surface) candIndex_ = i;
+            engine_.Candidates(kana_, candSegBegin_, candContentEnd_, prevRid, nextLid);
+
+        // (B) 文節全体スパン候補 (こうが → 甲賀、おきて → 掟 等)
+        if (hasTail) {
+            auto whole =
+                engine_.Candidates(kana_, candSegBegin_, candSegEnd_, prevRid, 0);
+            for (auto& cc : whole) {
+                bool dup = false;
+                for (const auto& ex : candidatesFull_)
+                    if (ex.surface == cc.surface) { dup = true; break; }
+                if (!dup) {
+                    cc.score += 800;  // 非学習の全文節候補はやや下位に
+                    cc.wholeSegment = true;
+                    candidatesFull_.push_back(std::move(cc));
+                }
+            }
+            std::stable_sort(candidatesFull_.begin(), candidatesFull_.end(),
+                             [](const Candidate& a, const Candidate& b) {
+                                 return a.score < b.score;
+                             });
         }
+
+        candidates_.clear();
+        for (const auto& cc : candidatesFull_)
+            candidates_.push_back(cc.wholeSegment ? cc.surface
+                                                  : cc.surface + candTailSurface_);
+        // 初回オープン時の開始位置を決定:
+        //   現在の表示が候補リスト先頭 [0] と一致する場合 → candIndex_=0 のまま
+        //   → +delta で [1](2番目候補) へ。
+        //   一致しない (学習済み全文節語等が先頭に割り込んでいる場合) → candIndex_=-1
+        //   → +delta で [0](1番目候補) へ。いずれの場合も1回目のスペースで
+        //   「現在表示の次に最も優先度の高い候補」を選ぶ。
+        if (!candidates_.empty() && candidates_[0] == seg.surface)
+            candIndex_ = 0;   // 現在表示 = 先頭 → 1つ先へ進む
+        else
+            candIndex_ = -1;  // 現在表示 ≠ 先頭 → 先頭候補から始める
         candOpen_ = true;
     }
+
     if (candidatesFull_.empty()) { SessionResult r; r.consumed = false; return r; }
     candIndex_ = (candIndex_ + delta + (int)candidatesFull_.size()) %
                  (int)candidatesFull_.size();
 
-    // 選択をピンとして固定し再デコード (文節全体を1ノード化)
+    // 選択をピンとして固定し再デコード
     const Candidate& c = candidatesFull_[candIndex_];
     std::vector<Pin> kept;
     for (auto& p : pins_)
-        if (p.end <= seg.begin || p.begin >= seg.end) kept.push_back(p);
+        if (p.end <= candSegBegin_ || p.begin >= candSegEnd_) kept.push_back(p);
     Pin pin;
-    pin.begin = seg.begin; pin.end = seg.end;
-    pin.surface = c.surface + seg.tailSurface;
-    pin.lid = c.lid;
-    pin.rid = hasTail ? seg.rid : c.rid;
+    pin.begin = candSegBegin_;
+    pin.end   = candSegEnd_;
+    if (c.wholeSegment) {
+        pin.surface      = c.surface;
+        pin.lid          = c.lid;
+        pin.rid          = c.rid;
+        pin.learnReading = KanaString(candSegBegin_, candSegEnd_);
+        pin.learnSurface = c.surface;
+    } else {
+        pin.surface      = c.surface + candTailSurface_;
+        pin.lid          = c.lid;
+        pin.rid          = candTailRid_;
+        pin.learnReading = KanaString(candSegBegin_, candContentEnd_);
+        pin.learnSurface = c.surface;
+    }
     kept.push_back(pin);
     pins_.swap(kept);
     return Refresh();
@@ -889,20 +1259,20 @@ SessionResult LiveSession::FunctionKey(int n) {
         case 9:                                               // 全角英数
         case 10: {                                            // 半角英数
             std::string ro = engine_.Romaji().ToRomaji(reading);
-            int mode = fnCase_ % 3;  // 0=小文字 1=大文字 2=先頭のみ大文字
+            int mode = fnCase_ % 3;
             std::string out;
             bool first = true;
             for (char ch : ro) {
-                char c = ch;
+                char cv = ch;
                 if (isalpha((unsigned char)ch)) {
-                    if (mode == 1) c = (char)toupper((unsigned char)ch);
+                    if (mode == 1) cv = (char)toupper((unsigned char)ch);
                     else if (mode == 2)
-                        c = first ? (char)toupper((unsigned char)ch)
-                                  : (char)tolower((unsigned char)ch);
-                    else c = (char)tolower((unsigned char)ch);
+                        cv = first ? (char)toupper((unsigned char)ch)
+                                   : (char)tolower((unsigned char)ch);
+                    else cv = (char)tolower((unsigned char)ch);
                     first = false;
                 }
-                out += c;
+                out += cv;
             }
             fnText_ = (n == 9) ? AsciiToZenkaku(out) : out;
             break;

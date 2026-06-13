@@ -4,11 +4,23 @@
 #include <functional>
 #include <olectl.h>
 #include <shellapi.h>
+#include <dwmapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+#ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+#define DWMWA_WINDOW_CORNER_PREFERENCE 33
+#endif
+#ifndef DWMWCP_ROUNDSMALL
+#define DWMWCP_ROUNDSMALL 3
+#endif
 
 // ---------------------------------------------------------------- GUIDs
 const CLSID CLSID_JimeTextService =
@@ -19,6 +31,13 @@ const GUID GUID_JimeDisplayAttributeInput =
     {0xC2D8E5A1, 0x4F6B, 0x4E29, {0xB0, 0xC3, 0x7A, 0x91, 0x8D, 0x5E, 0x2F, 0x46}};
 const GUID GUID_JimeDisplayAttributeFocused =
     {0xD4E9F6B2, 0x5A7C, 0x4F3A, {0x81, 0xD4, 0x8B, 0x02, 0x9E, 0x6F, 0x3A, 0x57}};
+// {E5FA07C3-6B8D, ...} 変換フラッシュ (背景色)
+static const GUID GUID_JimeDisplayAttributeFlash =
+    {0xE5FA07C3, 0x6B8D, 0x4A2B, {0x92, 0xE5, 0x9C, 0x13, 0xAF, 0x70, 0x4B, 0x68}};
+
+// 表示設定 (ReloadSettings で更新。表示属性プロバイダーが参照)
+static LONG g_underlineStyle = 0;            // 0=点線 1=実線 2=破線 3=波線 4=太線
+static COLORREF g_flashColor = RGB(255, 221, 120);
 
 // ---------------------------------------------------------------- utils
 std::wstring Utf8ToWide(const std::string& s) {
@@ -131,12 +150,31 @@ private:
     ULONG ref_ = 1;
 };
 
-static const TF_DISPLAYATTRIBUTE kDaInput = {
-    {TF_CT_NONE, 0}, {TF_CT_NONE, 0}, TF_LS_DOT, FALSE, {TF_CT_NONE, 0},
-    TF_ATTR_INPUT};
-static const TF_DISPLAYATTRIBUTE kDaFocused = {
-    {TF_CT_NONE, 0}, {TF_CT_NONE, 0}, TF_LS_SOLID, TRUE, {TF_CT_NONE, 0},
-    TF_ATTR_TARGET_CONVERTED};
+static TF_DISPLAYATTRIBUTE DaInput() {
+    TF_DISPLAYATTRIBUTE da = {{TF_CT_NONE, 0}, {TF_CT_NONE, 0}, TF_LS_DOT,
+                              FALSE,           {TF_CT_NONE, 0}, TF_ATTR_INPUT};
+    switch (g_underlineStyle) {
+        case 1: da.lsStyle = TF_LS_SOLID; break;
+        case 2: da.lsStyle = TF_LS_DASH; break;
+        case 3: da.lsStyle = TF_LS_SQUIGGLE; break;  // 波線
+        case 4: da.lsStyle = TF_LS_SOLID; da.fBoldLine = TRUE; break;
+        default: da.lsStyle = TF_LS_DOT; break;
+    }
+    return da;
+}
+static TF_DISPLAYATTRIBUTE DaFocused() {
+    TF_DISPLAYATTRIBUTE da = {{TF_CT_NONE, 0}, {TF_CT_NONE, 0}, TF_LS_SOLID,
+                              TRUE,            {TF_CT_NONE, 0},
+                              TF_ATTR_TARGET_CONVERTED};
+    return da;
+}
+static TF_DISPLAYATTRIBUTE DaFlash() {
+    TF_DISPLAYATTRIBUTE da = DaInput();
+    da.crBk.type = TF_CT_COLORREF;
+    da.crBk.cr = g_flashColor;
+    da.bAttr = TF_ATTR_CONVERTED;
+    return da;
+}
 
 class CEnumDisplayAttributeInfo : public IEnumTfDisplayAttributeInfo {
 public:
@@ -167,13 +205,17 @@ public:
     STDMETHODIMP Next(ULONG ulCount, ITfDisplayAttributeInfo** rgInfo,
                       ULONG* pcFetched) override {
         ULONG fetched = 0;
-        while (fetched < ulCount && index_ < 2) {
+        while (fetched < ulCount && index_ < 3) {
             if (index_ == 0)
                 rgInfo[fetched] = new CDisplayAttributeInfo(
-                    GUID_JimeDisplayAttributeInput, L"JIME Input", kDaInput);
+                    GUID_JimeDisplayAttributeInput, L"JIME Input", DaInput());
+            else if (index_ == 1)
+                rgInfo[fetched] = new CDisplayAttributeInfo(
+                    GUID_JimeDisplayAttributeFocused, L"JIME Focused",
+                    DaFocused());
             else
                 rgInfo[fetched] = new CDisplayAttributeInfo(
-                    GUID_JimeDisplayAttributeFocused, L"JIME Focused", kDaFocused);
+                    GUID_JimeDisplayAttributeFlash, L"JIME Flash", DaFlash());
             fetched++;
             index_++;
         }
@@ -196,31 +238,74 @@ private:
 
 // ---------------------------------------------------------------- CandidateWindow
 static const wchar_t kCandClass[] = L"JimeCandidateWindow";
-static const int kCandLineH = 22;
 static const int kCandMaxVisible = 9;
-static const int kCandWidth = 220;
+static const int kCandWidth = 240;
+static const int kCandPad = 6;       // ウィンドウ内余白
+
+static ULONG_PTR g_gdiplusToken = 0;
+static void EnsureGdiplus() {
+    if (!g_gdiplusToken) {
+        Gdiplus::GdiplusStartupInput input;
+        Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, nullptr);
+    }
+}
 
 CCandidateWindow::CCandidateWindow() {
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = g_hInst;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     wc.lpszClassName = kCandClass;
+    wc.style = CS_DROPSHADOW;
     RegisterClassW(&wc);  // 二重登録は失敗するだけなので無視
     hwnd_ = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, kCandClass, L"",
-        WS_POPUP | WS_BORDER, 0, 0, kCandWidth, 100, nullptr, nullptr, g_hInst,
-        this);
+        WS_POPUP, 0, 0, kCandWidth, 100, nullptr, nullptr, g_hInst, this);
+    if (hwnd_) {
+        // Windows 11: ネイティブ角丸。失敗時 (Win10) は SetWindowRgn で代替
+        int pref = DWMWCP_ROUNDSMALL;
+        dwmRounded_ = SUCCEEDED(DwmSetWindowAttribute(
+            hwnd_, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref)));
+    }
 }
 
 CCandidateWindow::~CCandidateWindow() {
     if (hwnd_) DestroyWindow(hwnd_);
+    if (image_) delete image_;
+}
+
+void CCandidateWindow::SetTheme(COLORREF bg, COLORREF text, COLORREF sel,
+                                const std::wstring& imagePath) {
+    bgColor_ = bg;
+    textColor_ = text;
+    selColor_ = sel;
+    if (imagePath != imagePath_) {
+        imagePath_ = imagePath;
+        if (image_) {
+            delete image_;
+            image_ = nullptr;
+        }
+        if (!imagePath_.empty()) {
+            EnsureGdiplus();
+            Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromFile(imagePath_.c_str());
+            if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) image_ = bmp;
+            else delete bmp;
+        }
+    }
+    if (hwnd_ && IsWindowVisible(hwnd_)) InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
 bool CCandidateWindow::IsVisible() const {
     return hwnd_ && IsWindowVisible(hwnd_);
 }
+
+void CCandidateWindow::SetFont(const std::wstring& name, int sizePx) {
+    if (!name.empty()) fontName_ = name;
+    if (sizePx >= 10 && sizePx <= 48) fontSize_ = sizePx;
+}
+
+int CCandidateWindow::LineHeight() const { return fontSize_ + 12; }
 
 void CCandidateWindow::Show(const std::vector<std::wstring>& items, int sel,
                             POINT pt) {
@@ -231,16 +316,19 @@ void CCandidateWindow::Show(const std::vector<std::wstring>& items, int sel,
     UpdateSelection(sel);
     int visible = (int)items_.size();
     if (visible > kCandMaxVisible) visible = kCandMaxVisible;
-    int h = visible * kCandLineH + 4;
+    int h = visible * LineHeight() + kCandPad * 2;
+    int w = kCandWidth;
     // 画面外にはみ出す場合は上に出す
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfo(mon, &mi);
     int x = pt.x, y = pt.y + 4;
     if (y + h > mi.rcWork.bottom) y = pt.y - h - 28;
-    if (x + kCandWidth > mi.rcWork.right) x = mi.rcWork.right - kCandWidth;
-    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, kCandWidth, h,
+    if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
+    SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!dwmRounded_)
+        SetWindowRgn(hwnd_, CreateRoundRectRgn(0, 0, w + 1, h + 1, 12, 12), TRUE);
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -259,35 +347,63 @@ void CCandidateWindow::Hide() {
 void CCandidateWindow::Paint(HDC hdc) {
     RECT rc;
     GetClientRect(hwnd_, &rc);
-    HFONT font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
-                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+    HBRUSH bgBrush = CreateSolidBrush(bgColor_);
+    FillRect(hdc, &rc, bgBrush);
+    DeleteObject(bgBrush);
+    if (image_) {
+        Gdiplus::Graphics g(hdc);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(image_, Gdiplus::Rect(0, 0, rc.right, rc.bottom));
+    }
+    const int lineH = LineHeight();
+    HFONT font = CreateFontW(-fontSize_, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                             FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                             DEFAULT_PITCH, L"Meiryo UI");
+                             DEFAULT_PITCH, fontName_.c_str());
+    HFONT numFont = CreateFontW(-(fontSize_ - 3), 0, 0, 0, FW_NORMAL, FALSE,
+                                FALSE, FALSE, DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                                L"Segoe UI");
     HGDIOBJ oldFont = SelectObject(hdc, font);
     SetBkMode(hdc, TRANSPARENT);
-    int y = 2;
+    int y = kCandPad;
     for (int i = scrollTop_;
          i < (int)items_.size() && i < scrollTop_ + kCandMaxVisible; i++) {
-        RECT line = {2, y, rc.right - 2, y + kCandLineH};
+        RECT line = {kCandPad, y, rc.right - kCandPad, y + lineH};
         if (i == sel_) {
-            HBRUSH sel = CreateSolidBrush(RGB(0, 120, 215));
-            FillRect(hdc, &line, sel);
-            DeleteObject(sel);
-            SetTextColor(hdc, RGB(255, 255, 255));
-        } else {
-            SetTextColor(hdc, RGB(20, 20, 20));
+            // 角丸のアクセント色ハイライト
+            HBRUSH selBrush = CreateSolidBrush(selColor_);
+            HPEN selPen = CreatePen(PS_SOLID, 1, selColor_);
+            HGDIOBJ ob = SelectObject(hdc, selBrush);
+            HGDIOBJ op = SelectObject(hdc, selPen);
+            RoundRect(hdc, line.left, line.top + 1, line.right, line.bottom - 1,
+                      8, 8);
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            DeleteObject(selBrush);
+            DeleteObject(selPen);
         }
+        // 番号 (小さめ・薄め)
         wchar_t num[8];
-        wsprintfW(num, L"%d ", (i % 9) + 1);
-        std::wstring text = std::wstring(num) + items_[i];
+        wsprintfW(num, L"%d", (i % 9) + 1);
+        RECT nr = line;
+        nr.left += 8;
+        SelectObject(hdc, numFont);
+        SetTextColor(hdc, i == sel_ ? RGB(200, 222, 245) : RGB(150, 150, 150));
+        DrawTextW(hdc, num, -1, &nr, DT_SINGLELINE | DT_VCENTER);
+        // 候補本体
         RECT tr = line;
-        tr.left += 6;
-        DrawTextW(hdc, text.c_str(), (int)text.size(), &tr,
+        tr.left += 26;
+        SelectObject(hdc, font);
+        SetTextColor(hdc, i == sel_ ? RGB(255, 255, 255) : textColor_);
+        DrawTextW(hdc, items_[i].c_str(), (int)items_[i].size(), &tr,
                   DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-        y += kCandLineH;
+        y += lineH;
     }
     SelectObject(hdc, oldFont);
     DeleteObject(font);
+    DeleteObject(numFont);
 }
 
 LRESULT CALLBACK CCandidateWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam,
@@ -502,6 +618,14 @@ CTextService::~CTextService() {
         composition_->Release();
         composition_ = nullptr;
     }
+    if (compositionContext_) {
+        compositionContext_->Release();
+        compositionContext_ = nullptr;
+    }
+    if (flashWnd_) {
+        DestroyWindow(flashWnd_);
+        flashWnd_ = nullptr;
+    }
     DllRelease();
 }
 
@@ -561,6 +685,7 @@ STDMETHODIMP CTextService::ActivateEx(ITfThreadMgr* ptim, TfClientId tid,
                                    (void**)&catMgr))) {
         catMgr->RegisterGUID(GUID_JimeDisplayAttributeInput, &attrInput_);
         catMgr->RegisterGUID(GUID_JimeDisplayAttributeFocused, &attrFocused_);
+        catMgr->RegisterGUID(GUID_JimeDisplayAttributeFlash, &attrFlash_);
         catMgr->Release();
     }
     ReloadSettings();
@@ -572,6 +697,11 @@ STDMETHODIMP CTextService::ActivateEx(ITfThreadMgr* ptim, TfClientId tid,
 STDMETHODIMP CTextService::Deactivate() {
     if (session_ && session_->Composing()) session_->Clear();
     HideCandidates();
+    ReleaseCompositionContext();
+    if (flashWnd_) {
+        DestroyWindow(flashWnd_);
+        flashWnd_ = nullptr;
+    }
     tray::Destroy();
     if (threadMgr_) {
         ITfKeystrokeMgr* keyMgr = nullptr;
@@ -588,6 +718,20 @@ STDMETHODIMP CTextService::Deactivate() {
 }
 
 // ---------------------------------------------------------------- engine
+// ---------------------------------------------------------------- フラッシュ用隠しウィンドウ
+static const wchar_t kFlashWndClass[] = L"JimeFlashWnd";
+
+static LRESULT CALLBACK FlashWndProc(HWND hwnd, UINT msg, WPARAM wParam,
+                                     LPARAM lParam) {
+    if (msg == WM_TIMER) {
+        CTextService* svc =
+            (CTextService*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (svc) svc->OnFlashTimer();
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 static std::wstring UserDictPath() {
     wchar_t buf[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"APPDATA", buf, MAX_PATH);
@@ -605,10 +749,26 @@ bool CTextService::EnsureEngine() {
         return false;
     }
     std::wstring ud = UserDictPath();
-    if (!ud.empty()) engine_.LoadUserDict(WideToUtf8(ud));
+    if (!ud.empty()) {
+        engine_.LoadUserDict(WideToUtf8(ud));
+        std::wstring dir = ud.substr(0, ud.find_last_of(L'\\'));
+        engine_.SetLearningPath(WideToUtf8(dir + L"\\learning.tsv"));
+    }
     engineLoaded_ = true;
     session_.reset(new jime::LiveSession(engine_));
     candWnd_.reset(new CCandidateWindow());
+    ReloadSettings();  // フォント/テーマ/入力設定をセッションへ反映
+    if (!flashWnd_) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = FlashWndProc;
+        wc.hInstance = g_hInst;
+        wc.lpszClassName = kFlashWndClass;
+        RegisterClassW(&wc);  // 二重登録は無視
+        flashWnd_ = CreateWindowW(kFlashWndClass, L"", 0, 0, 0, 0, 0,
+                                  HWND_MESSAGE, nullptr, g_hInst, nullptr);
+        if (flashWnd_)
+            SetWindowLongPtrW(flashWnd_, GWLP_USERDATA, (LONG_PTR)this);
+    }
     return true;
 }
 
@@ -623,6 +783,36 @@ void CTextService::ReloadSettings() {
     optConvertKeyOn_ = readDword(L"ConvertKeyOn", 1) != 0;
     optNonConvertKeyOff_ = readDword(L"NonConvertKeyOff", 1) != 0;
     engine_.SetRescorerEnabled(readDword(L"HybridRescoring", 1) != 0);
+    engine_.SetLearningEnabled(readDword(L"Learning", 1) != 0);
+    // 表示設定
+    auto readString = [](const wchar_t* name,
+                         const std::wstring& def) -> std::wstring {
+        wchar_t buf[512];
+        DWORD size = sizeof(buf);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\JIME", name,
+                         RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS)
+            return def;
+        return buf;
+    };
+    candFontName_ = readString(L"CandidateFontName", L"Meiryo UI");
+    candFontSize_ = (int)readDword(L"CandidateFontSize", 15);
+    flashEnabled_ = readDword(L"FlashEnabled", 1) != 0;
+    flashColor_ = (COLORREF)readDword(L"FlashColor", RGB(255, 221, 120));
+    g_flashColor = flashColor_;
+    g_underlineStyle = (LONG)readDword(L"UnderlineStyle", 0);
+    if (candWnd_) {
+        candWnd_->SetFont(candFontName_, candFontSize_);
+        candWnd_->SetTheme(
+            (COLORREF)readDword(L"CandBgColor", RGB(255, 255, 255)),
+            (COLORREF)readDword(L"CandTextColor", RGB(32, 32, 32)),
+            (COLORREF)readDword(L"CandSelColor", RGB(0, 103, 192)),
+            readString(L"CandBgImage", L""));
+    }
+    // 入力設定
+    if (session_) {
+        session_->SetFullWidthSymbols(readDword(L"FullWidthSymbols", 1) != 0);
+        session_->SetLatexMode((int)readDword(L"LatexMode", 1));
+    }
 }
 
 bool CTextService::IsImeOn() {
@@ -711,6 +901,7 @@ bool CTextService::IsKeyEaten(WPARAM w) {
             case VK_F6: case VK_F7: case VK_F8: case VK_F9: case VK_F10:
                 return true;
         }
+        if (w == VK_TAB) return session_->LatexActive();
     } else if (w == VK_SPACE) {
         return true;  // 全角スペース挿入
     }
@@ -827,9 +1018,15 @@ STDMETHODIMP CTextService::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM,
             if (!composing) { handled = false; break; }
             r = session_->FunctionKey((int)(wParam - VK_F6) + 6);
             break;
+        case VK_TAB:
+            if (!composing || !session_->LatexActive()) { handled = false; break; }
+            r = session_->ConvertLatexToken();
+            break;
         case VK_SPACE:
         case VK_CONVERT:
-            if (composing) {
+            if (composing && session_->LatexActive()) {
+                r = session_->ConvertLatexToken();  // \token を明示変換
+            } else if (composing) {
                 r = session_->NextCandidate(+1);
             } else if (wParam == VK_SPACE) {
                 bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -842,9 +1039,10 @@ STDMETHODIMP CTextService::OnKeyDown(ITfContext* pic, WPARAM wParam, LPARAM,
             char c = VkToChar(wParam);
             if (c == 0) { handled = false; break; }
             if (!composing) {
-                // 新規コンポジション開始時に設定/ユーザー辞書の更新を反映
+                // 新規コンポジション開始時に設定/辞書/学習の更新を反映
                 ReloadSettings();
                 engine_.ReloadUserDictIfChanged();
+                engine_.ReloadLearningIfChanged();
             }
             r = session_->InputChar(c);
             break;
@@ -890,6 +1088,10 @@ void CTextService::OnEditApply(TfEditCookie ec, ITfContext* pic,
                     pcc->StartComposition(ec, range, (ITfCompositionSink*)this,
                                           &composition_);
                     pcc->Release();
+                    if (composition_ && !compositionContext_) {
+                        compositionContext_ = pic;
+                        pic->AddRef();
+                    }
                 }
                 range->Release();
             }
@@ -923,6 +1125,7 @@ void CTextService::OnEditApply(TfEditCookie ec, ITfContext* pic,
         composition_->EndComposition(ec);
         composition_->Release();
         composition_ = nullptr;
+        ReleaseCompositionContext();
         // キャレットは挿入末尾に置かれる
         ITfRange* endR = nullptr;
         if (SUCCEEDED(range->Clone(&endR)) && endR) {
@@ -939,40 +1142,64 @@ void CTextService::OnEditApply(TfEditCookie ec, ITfContext* pic,
         return;
     }
 
-    // 表示属性 (下線) を適用
+    // 表示属性 (下線 + フォーカス文節) を適用
+    lastSpans16_.clear();
+    for (auto& sp : r.segmentSpans)
+        lastSpans16_.push_back({Utf8OffsetToWide(r.composition, sp.first),
+                                Utf8OffsetToWide(r.composition, sp.second)});
+    lastFocusedIdx_ = r.focusedSegment;
+    ReapplyAttributes(ec, pic);
+
+    // 変換フラッシュ: 直前表示との差分に漢字が現れたら背景色を一瞬変える
+    if (flashEnabled_ && commitW.empty()) {
+        size_t p = 0;
+        while (p < lastCompW_.size() && p < compW.size() &&
+               lastCompW_[p] == compW[p])
+            p++;
+        size_t s = 0;
+        while (s < lastCompW_.size() - p && s < compW.size() - p &&
+               lastCompW_[lastCompW_.size() - 1 - s] ==
+                   compW[compW.size() - 1 - s])
+            s++;
+        int fb = (int)p;
+        int fe = (int)compW.size() - (int)s;
+        bool hasKanji = false;
+        for (int i = fb; i < fe && i < (int)compW.size(); i++) {
+            wchar_t c = compW[i];
+            if ((c >= 0x4E00 && c <= 0x9FFF) || c == 0x3005) {
+                hasKanji = true;
+                break;
+            }
+        }
+        if (hasKanji && fe > fb) {
+            ITfRange* cr = nullptr;
+            if (SUCCEEDED(composition_->GetRange(&cr)) && cr) {
+                ITfProperty* prop = nullptr;
+                if (SUCCEEDED(pic->GetProperty(GUID_PROP_ATTRIBUTE, &prop))) {
+                    ITfRange* fr = nullptr;
+                    if (SUCCEEDED(cr->Clone(&fr)) && fr) {
+                        fr->Collapse(ec, TF_ANCHOR_START);
+                        LONG moved = 0;
+                        fr->ShiftEnd(ec, fe, &moved, nullptr);
+                        fr->ShiftStart(ec, fb, &moved, nullptr);
+                        VARIANT var;
+                        var.vt = VT_I4;
+                        var.lVal = attrFlash_;
+                        prop->SetValue(ec, fr, &var);
+                        fr->Release();
+                    }
+                    prop->Release();
+                }
+                cr->Release();
+            }
+            if (flashWnd_) SetTimer(flashWnd_, 1, 180, nullptr);
+        }
+    }
+    lastCompW_ = compW;
+
+    // キャレットを末尾へ
     ITfRange* compRange = nullptr;
     if (SUCCEEDED(composition_->GetRange(&compRange)) && compRange) {
-        ITfProperty* prop = nullptr;
-        if (SUCCEEDED(pic->GetProperty(GUID_PROP_ATTRIBUTE, &prop))) {
-            VARIANT var;
-            var.vt = VT_I4;
-            var.lVal = attrInput_;
-            prop->SetValue(ec, compRange, &var);
-            // フォーカス文節を強調
-            lastSpans16_.clear();
-            for (auto& sp : r.segmentSpans)
-                lastSpans16_.push_back(
-                    {Utf8OffsetToWide(r.composition, sp.first),
-                     Utf8OffsetToWide(r.composition, sp.second)});
-            if (r.focusedSegment >= 0 &&
-                r.focusedSegment < (int)lastSpans16_.size()) {
-                auto [b, e] = lastSpans16_[r.focusedSegment];
-                ITfRange* seg = nullptr;
-                if (SUCCEEDED(compRange->Clone(&seg)) && seg) {
-                    seg->Collapse(ec, TF_ANCHOR_START);
-                    LONG moved = 0;
-                    seg->ShiftEnd(ec, e, &moved, nullptr);
-                    seg->ShiftStart(ec, b, &moved, nullptr);
-                    VARIANT var2;
-                    var2.vt = VT_I4;
-                    var2.lVal = attrFocused_;
-                    prop->SetValue(ec, seg, &var2);
-                    seg->Release();
-                }
-            }
-            prop->Release();
-        }
-        // キャレットを末尾へ
         ITfRange* endR = nullptr;
         if (SUCCEEDED(compRange->Clone(&endR)) && endR) {
             endR->Collapse(ec, TF_ANCHOR_END);
@@ -987,6 +1214,66 @@ void CTextService::OnEditApply(TfEditCookie ec, ITfContext* pic,
     }
     range->Release();
     UpdateCandidateWindow(ec, pic);
+}
+
+void CTextService::ReapplyAttributes(TfEditCookie ec, ITfContext* pic) {
+    if (!composition_ || !pic) return;
+    ITfRange* range = nullptr;
+    if (FAILED(composition_->GetRange(&range)) || !range) return;
+    ITfProperty* prop = nullptr;
+    if (SUCCEEDED(pic->GetProperty(GUID_PROP_ATTRIBUTE, &prop))) {
+        VARIANT var;
+        var.vt = VT_I4;
+        var.lVal = attrInput_;
+        prop->SetValue(ec, range, &var);
+        if (lastFocusedIdx_ >= 0 &&
+            lastFocusedIdx_ < (int)lastSpans16_.size()) {
+            auto [b, e] = lastSpans16_[lastFocusedIdx_];
+            ITfRange* seg = nullptr;
+            if (SUCCEEDED(range->Clone(&seg)) && seg) {
+                seg->Collapse(ec, TF_ANCHOR_START);
+                LONG moved = 0;
+                seg->ShiftEnd(ec, e, &moved, nullptr);
+                seg->ShiftStart(ec, b, &moved, nullptr);
+                VARIANT var2;
+                var2.vt = VT_I4;
+                var2.lVal = attrFocused_;
+                prop->SetValue(ec, seg, &var2);
+                seg->Release();
+            }
+        }
+        prop->Release();
+    }
+    range->Release();
+}
+
+void CTextService::OnFlashTimer() {
+    if (flashWnd_) KillTimer(flashWnd_, 1);
+    if (!composition_ || !compositionContext_) return;
+    ITfContext* pic = compositionContext_;
+    pic->AddRef();
+    CEditSession* es = new CEditSession([this, pic](TfEditCookie ec) {
+        ReapplyAttributes(ec, pic);
+        pic->Release();
+        return S_OK;
+    });
+    HRESULT hr = S_OK;
+    if (FAILED(pic->RequestEditSession(clientId_, es,
+                                       TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+                                       &hr)))
+        pic->Release();
+    es->Release();
+}
+
+void CTextService::ReleaseCompositionContext() {
+    if (flashWnd_) KillTimer(flashWnd_, 1);
+    if (compositionContext_) {
+        compositionContext_->Release();
+        compositionContext_ = nullptr;
+    }
+    lastCompW_.clear();
+    lastFocusedIdx_ = -1;
+    lastSpans16_.clear();
 }
 
 void CTextService::UpdateCandidateWindow(TfEditCookie ec, ITfContext* pic) {
@@ -1040,6 +1327,7 @@ STDMETHODIMP CTextService::OnCompositionTerminated(TfEditCookie,
         composition_->Release();
         composition_ = nullptr;
     }
+    ReleaseCompositionContext();
     if (session_) session_->Clear();
     HideCandidates();
     return S_OK;
@@ -1073,12 +1361,17 @@ STDMETHODIMP CTextService::GetDisplayAttributeInfo(
     if (!ppInfo) return E_INVALIDARG;
     if (IsEqualGUID(guid, GUID_JimeDisplayAttributeInput)) {
         *ppInfo = new CDisplayAttributeInfo(GUID_JimeDisplayAttributeInput,
-                                            L"JIME Input", kDaInput);
+                                            L"JIME Input", DaInput());
         return S_OK;
     }
     if (IsEqualGUID(guid, GUID_JimeDisplayAttributeFocused)) {
         *ppInfo = new CDisplayAttributeInfo(GUID_JimeDisplayAttributeFocused,
-                                            L"JIME Focused", kDaFocused);
+                                            L"JIME Focused", DaFocused());
+        return S_OK;
+    }
+    if (IsEqualGUID(guid, GUID_JimeDisplayAttributeFlash)) {
+        *ppInfo = new CDisplayAttributeInfo(GUID_JimeDisplayAttributeFlash,
+                                            L"JIME Flash", DaFlash());
         return S_OK;
     }
     *ppInfo = nullptr;

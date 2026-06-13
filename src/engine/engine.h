@@ -60,6 +60,28 @@ private:
     std::vector<std::pair<uint32_t, int16_t>> table_;
 };
 
+// ---------------------------------------------------------------- Learning
+// 候補選択の学習。Space で選んだ候補が確定されるたびに (読み, 表層) を
+// カウントし、以後の変換で語コストにボーナスを与える。
+// 保存形式: TSV "読み\t表層\t回数"。プロセス間は mtime で再読込。
+class LearningStore {
+public:
+    void SetPath(const std::string& path);
+    bool ReloadIfChanged();
+    void Record(const std::string& reading, const std::string& surface);
+    // 該当読みの学習エントリ (無ければ nullptr)
+    const std::vector<std::pair<std::string, uint32_t>>* Find(
+        const std::string& reading) const;
+    // 回数 → コストボーナス (負値)。1回=-400、対数飽和で最大 -1500。
+    static int Bonus(uint32_t count);
+private:
+    void Save() const;
+    std::unordered_map<std::string,
+                       std::vector<std::pair<std::string, uint32_t>>> byReading_;
+    std::string path_;
+    int64_t mtime_ = -1;
+};
+
 // ---------------------------------------------------------------- Romaji
 // kana.txt (CSV: 出力,キー1,キー2,...) による最長一致ローマ字→かな変換。
 // 出力中の ASCII 文字は未処理入力として先頭に戻される (例: "nnb"→"んb")。
@@ -92,6 +114,7 @@ struct Node {
     int16_t wcost = 0;
     bool functional = false;
     bool punct = false;
+    bool learned = false;          // 学習ボーナス適用済み (補正減衰に使用)
     // viterbi
     int64_t total = 0;
     int prev = -1;
@@ -113,11 +136,16 @@ struct Pin {                        // 手動候補選択の固定
     int begin = 0, end = 0;
     std::string surface;
     uint16_t lid = 0, rid = 0;
+    // 確定時に学習へ記録する内容 (自立語部分のみ)
+    std::string learnReading;
+    std::string learnSurface;
 };
 
 struct Candidate {
     std::string surface;
     uint16_t lid = 0, rid = 0;
+    int64_t score = 0;          // 並び順 (小さいほど上位)
+    bool wholeSegment = false;  // 文節全体読みの単語 (付属語を連結しない)
 };
 
 // ---------------------------------------------------------------- Engine
@@ -134,6 +162,22 @@ public:
     // ハイブリッド補正 (nn_model.bin) の有効/無効
     void SetRescorerEnabled(bool on) { rescorerEnabled_ = on; }
     bool RescorerActive() const { return rescorerEnabled_ && rescorer_.Loaded(); }
+
+    // LaTeX 風記号 (\sigma 等)。data/latex_symbols.json から読み込み。
+    const std::string* LatexLookup(const std::string& name) const {
+        auto it = latexMap_.find(name);
+        return (it == latexMap_.end()) ? nullptr : &it->second;
+    }
+    bool LatexAvailable() const { return !latexMap_.empty(); }
+
+    // 候補選択学習
+    void SetLearningPath(const std::string& path) { learning_.SetPath(path); }
+    bool ReloadLearningIfChanged() { return learning_.ReloadIfChanged(); }
+    void SetLearningEnabled(bool on) { learningEnabled_ = on; }
+    void RecordSelection(const std::string& reading, const std::string& surface) {
+        if (learningEnabled_ && !reading.empty() && !surface.empty())
+            learning_.Record(reading, surface);
+    }
 
     // かな列 (UTF-8 codepoint 単位) を文節列にデコード。pins は固定制約。
     std::vector<Segment> Decode(const std::vector<std::string>& kana,
@@ -156,6 +200,9 @@ private:
     std::string userDictPath_;
     int64_t userDictMtime_ = -1;
     bool rescorerEnabled_ = true;
+    LearningStore learning_;
+    bool learningEnabled_ = true;
+    std::unordered_map<std::string, std::string> latexMap_;
 };
 
 // ---------------------------------------------------------------- LiveSession
@@ -171,7 +218,7 @@ struct SessionResult {
 
 class LiveSession {
 public:
-    explicit LiveSession(const Engine& engine) : engine_(engine) {}
+    explicit LiveSession(Engine& engine) : engine_(engine) {}
 
     static constexpr int kMaxPendingSegments = 5;  // 変換待ちキュー長 (文節)
 
@@ -184,7 +231,18 @@ public:
     // F6=ひらがな F7=全角カナ F8=半角カナ F9=全角英数 F10=半角英数
     // F9/F10 は再押下で 小文字→大文字→先頭大文字 を循環
     SessionResult FunctionKey(int n);
-    bool Composing() const { return !kana_.empty() || !pendingRomaji_.empty(); }
+
+    // LaTeX 風記号入力 (\ で開始)
+    SessionResult ConvertLatexToken();       // Space/Tab での明示変換
+    bool LatexActive() const { return latexActive_; }
+    // 0=変換しない (\ は文字として入力) / 1=自動変換 (非英字で確定) /
+    // 2=ショートカット変換 (Space/Tab のみ)
+    void SetLatexMode(int mode) { latexMode_ = mode; }
+    // 記号の全角入力 ([→「 ]→」 !→！ 等)
+    void SetFullWidthSymbols(bool on) { fullWidthSymbols_ = on; }
+    bool Composing() const {
+        return !kana_.empty() || !pendingRomaji_.empty() || latexActive_;
+    }
     const std::vector<std::string>& CandidateList() const { return candidates_; }
     int CandidateIndex() const { return candIndex_; }
     bool CandidateOpen() const { return candOpen_; }
@@ -197,7 +255,7 @@ private:
     void ResetFocus();
     std::string KanaString(int begin, int end) const;
 
-    const Engine& engine_;
+    Engine& engine_;
     std::vector<std::string> kana_;        // 確定かな (codepoint 毎)
     std::string pendingRomaji_;
     std::vector<Pin> pins_;
@@ -207,9 +265,18 @@ private:
     std::vector<Candidate> candidatesFull_;
     std::vector<std::string> candidates_;
     int candIndex_ = -1;
+    // 候補オープン時の文節構造 (ピンで再デコードされても元のスパンを保持)
+    int candSegBegin_ = 0, candSegEnd_ = 0, candContentEnd_ = 0;
+    uint16_t candTailRid_ = 0;
+    std::string candTailSurface_;
     int fnMode_ = 0;        // 0=通常 / 6..10=ファンクション変換表示中
     int fnCase_ = 0;        // F9/F10 の大小文字循環
     std::string fnText_;
+    bool latexActive_ = false;
+    std::string latexToken_;
+    int latexMode_ = 1;
+    bool fullWidthSymbols_ = true;
+    void FinishLatex(bool convert);
 };
 
 // ---------------------------------------------------------------- utf8 utils

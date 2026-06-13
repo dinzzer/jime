@@ -28,12 +28,12 @@ if(WIN32)
         src/tsf/DllServer.cpp
         src/tsf/jime.def
     )
-    target_link_libraries(jime PRIVATE jime_engine user32 gdi32 ole32 oleaut32 advapi32 shell32 uuid)
+    target_link_libraries(jime PRIVATE jime_engine user32 gdi32 ole32 oleaut32 advapi32 shell32 dwmapi gdiplus uuid)
     set_target_properties(jime PROPERTIES PREFIX "")
 
     # 設定コンソール
     add_executable(jime_config WIN32
         src/config/jime_config.cpp
     )
-    target_link_libraries(jime_config PRIVATE user32 gdi32 advapi32)
+    target_link_libraries(jime_config PRIVATE user32 gdi32 advapi32 comdlg32 dwmapi)
 endif()
