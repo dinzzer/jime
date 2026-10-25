@@ -949,8 +949,10 @@ void LiveSession::AutoCommit(std::string& out) {
     if (segments_.empty()) return;
     int cutSeg = 0;
     // 句読点で確定 (最後の句読点文節まで)
-    for (int i = 0; i < (int)segments_.size(); i++)
-        if (segments_[i].endsWithPunct) cutSeg = i + 1;
+    if (autoCommitPunctuation_) {
+        for (int i = 0; i < (int)segments_.size(); i++)
+            if (segments_[i].endsWithPunct) cutSeg = i + 1;
+    }
     // 変換待ちキュー長超過
     int remain = (int)segments_.size() - cutSeg;
     if (remain > kMaxPendingSegments)
@@ -1193,6 +1195,41 @@ SessionResult LiveSession::NextCandidate(int delta) {
                              [](const Candidate& a, const Candidate& b) {
                                  return a.score < b.score;
                              });
+        }
+
+        // Punctuation normally belongs to the preceding segment. Offer complete
+        // segment variants so choosing a comma does not discard or duplicate
+        // the word or its suffix (e.g. 「はい、」 -> 「はい,」).
+        const char* punctuation[][4] = {
+            {"、", ",", "，", "､"},
+            {"。", ".", "．", "｡"},
+        };
+        for (int variant = 0; variant < 4; ++variant) {
+            std::string surface = seg.surface;
+            for (const auto& forms : punctuation) {
+                if (seg.reading.find(forms[0]) == std::string::npos) continue;
+                for (int source = 0; source < 4; ++source) {
+                    if (source == variant) continue;
+                    size_t pos = 0;
+                    while ((pos = surface.find(forms[source], pos)) != std::string::npos) {
+                        surface.replace(pos, std::strlen(forms[source]), forms[variant]);
+                        pos += std::strlen(forms[variant]);
+                    }
+                }
+            }
+            if (surface == seg.surface) continue;
+            bool duplicate = false;
+            for (const auto& existing : candidatesFull_) {
+                const auto rendered = existing.wholeSegment ? existing.surface
+                                                            : existing.surface + candTailSurface_;
+                if (rendered == surface) { duplicate = true; break; }
+            }
+            if (!duplicate) {
+                Candidate c{surface, seg.lid, seg.rid};
+                c.wholeSegment = true;
+                c.score = 900002 + variant;
+                candidatesFull_.push_back(std::move(c));
+            }
         }
 
         candidates_.clear();

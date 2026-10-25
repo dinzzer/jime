@@ -21,6 +21,14 @@ add_executable(jime_test
 )
 target_link_libraries(jime_test PRIVATE jime_engine)
 
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(jime_session_test src/engine/session_test.cpp)
+    target_link_libraries(jime_session_test PRIVATE jime_engine)
+    add_test(NAME session_punctuation COMMAND jime_session_test
+        "${CMAKE_CURRENT_SOURCE_DIR}/data" "${CMAKE_CURRENT_SOURCE_DIR}/kana.txt")
+endif()
+
 # ---- TSF テキストサービス DLL (Windows のみ) ----
 if(WIN32)
     add_library(jime SHARED

@@ -240,6 +240,7 @@ public:
     void SetLatexMode(int mode) { latexMode_ = mode; }
     // 記号の全角入力 ([→「 ]→」 !→！ 等)
     void SetFullWidthSymbols(bool on) { fullWidthSymbols_ = on; }
+    void SetAutoCommitPunctuation(bool on) { autoCommitPunctuation_ = on; }
     bool Composing() const {
         return !kana_.empty() || !pendingRomaji_.empty() || latexActive_;
     }
@@ -276,6 +277,7 @@ private:
     std::string latexToken_;
     int latexMode_ = 1;
     bool fullWidthSymbols_ = true;
+    bool autoCommitPunctuation_ = true;
     void FinishLatex(bool convert);
 };
 

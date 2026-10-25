@@ -36,6 +36,7 @@ enum {
     IDC_CHK_LEARN,
     IDC_CHK_ZENKIGOU = 110,
     IDC_CMB_LATEX,
+    IDC_CHK_PUNCT,
     IDC_LBL_FONT = 120,
     IDC_BTN_FONT,
     IDC_CMB_UNDERLINE,
@@ -238,7 +239,7 @@ void UpdateFontLabel(HWND hwnd) {
     std::wstring name = ReadRegString(L"CandidateFontName", L"Meiryo UI");
     DWORD size = ReadRegDword(L"CandidateFontSize", 15);
     wchar_t text[96];
-    wsprintfW(text, L"%s, %upx", name.c_str(), size);
+    wsprintfW(text, L"%s, %u DIP", name.c_str(), size);
     SetWindowTextW(GetDlgItem(hwnd, IDC_LBL_FONT), text);
 }
 
@@ -257,6 +258,8 @@ void UpdateImageLabel(HWND hwnd) {
 // ---------------------------------------------------------------- window
 HWND Create(HWND parent, const wchar_t* cls, const wchar_t* text, DWORD style,
             int x, int y, int w, int h, int id, HFONT font = nullptr) {
+    // Reserve one input-option row; keep the footer and overall window size.
+    if (y >= 208 && y < 678 && id != IDC_CHK_PUNCT) y += 28;
     HWND hwnd = CreateWindowW(cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w,
                               h, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
     SendMessageW(hwnd, WM_SETFONT, (WPARAM)(font ? font : g_font), TRUE);
@@ -309,6 +312,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CheckDlgButton(hwnd, IDC_CHK_ZENKIGOU,
                            ReadRegDword(L"FullWidthSymbols", 1) ? BST_CHECKED
                                                                 : BST_UNCHECKED);
+            Create(hwnd, L"BUTTON", L"句読点で自動確定する",
+                   BS_AUTOCHECKBOX, 32, 208, 410, 22, IDC_CHK_PUNCT);
+            CheckDlgButton(hwnd, IDC_CHK_PUNCT,
+                           ReadRegDword(L"AutoCommitPunctuation", 1) ? BST_CHECKED
+                                                                    : BST_UNCHECKED);
             Create(hwnd, L"STATIC", L"LaTeX 記号入力 (\\sigma → σ):", 0, 32,
                    212, 184, 20, 0);
             HWND cmbL = Create(hwnd, L"COMBOBOX", L"",
@@ -383,7 +391,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                    IDC_BTN_ADD);
             Create(hwnd, L"LISTBOX", L"",
                    WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                   32, 522, 410, 148, IDC_LIST_DICT);
+                   32, 522, 410, 120, IDC_LIST_DICT);
             Create(hwnd, L"BUTTON", L"選択した項目を削除", BS_PUSHBUTTON, 32,
                    678, 160, 28, IDC_BTN_DELETE);
             Create(hwnd, L"STATIC",
@@ -437,6 +445,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     WriteRegDword(L"FullWidthSymbols",
                                   IsDlgButtonChecked(hwnd, id) == BST_CHECKED);
                     return 0;
+                case IDC_CHK_PUNCT:
+                    WriteRegDword(L"AutoCommitPunctuation",
+                                  IsDlgButtonChecked(hwnd, id) == BST_CHECKED);
+                    return 0;
                 case IDC_CHK_FLASH:
                     WriteRegDword(L"FlashEnabled",
                                   IsDlgButtonChecked(hwnd, id) == BST_CHECKED);
@@ -460,7 +472,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     std::wstring cur =
                         ReadRegString(L"CandidateFontName", L"Meiryo UI");
                     lstrcpynW(lf.lfFaceName, cur.c_str(), LF_FACESIZE);
-                    lf.lfHeight = -(LONG)ReadRegDword(L"CandidateFontSize", 15);
+                    HDC screen = GetDC(hwnd);
+                    int dpi = GetDeviceCaps(screen, LOGPIXELSY);
+                    ReleaseDC(hwnd, screen);
+                    lf.lfHeight = -MulDiv((int)ReadRegDword(L"CandidateFontSize", 15),
+                                         dpi, 96);
                     lf.lfCharSet = DEFAULT_CHARSET;
                     CHOOSEFONTW cf = {sizeof(cf)};
                     cf.hwndOwner = hwnd;
@@ -468,7 +484,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT |
                                CF_NOVERTFONTS;
                     if (ChooseFontW(&cf)) {
-                        int px = lf.lfHeight < 0 ? -lf.lfHeight : lf.lfHeight;
+                        // CHOOSEFONT returns tenths of a point. Store logical
+                        // pixels, independent of the settings window's monitor.
+                        int px = MulDiv(cf.iPointSize, 96, 720);
                         if (px < 10) px = 10;
                         if (px > 48) px = 48;
                         WriteRegString(L"CandidateFontName", lf.lfFaceName);

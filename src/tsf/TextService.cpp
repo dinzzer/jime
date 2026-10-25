@@ -305,7 +305,12 @@ void CCandidateWindow::SetFont(const std::wstring& name, int sizePx) {
     if (sizePx >= 10 && sizePx <= 48) fontSize_ = sizePx;
 }
 
-int CCandidateWindow::LineHeight() const { return fontSize_ + 12; }
+int CCandidateWindow::Scale(int value) const {
+    UINT dpi = hwnd_ ? GetDpiForWindow(hwnd_) : 96;
+    return MulDiv(value, dpi ? dpi : 96, 96);
+}
+
+int CCandidateWindow::LineHeight() const { return Scale(fontSize_ + 12); }
 
 void CCandidateWindow::Show(const std::vector<std::wstring>& items, int sel,
                             POINT pt) {
@@ -314,21 +319,28 @@ void CCandidateWindow::Show(const std::vector<std::wstring>& items, int sel,
     sel_ = sel;
     scrollTop_ = 0;
     UpdateSelection(sel);
+    // Move to the caret's monitor before querying the window DPI. Do not change
+    // the host application's DPI awareness: TSF loads this DLL into that process.
+    SetWindowPos(hwnd_, nullptr, pt.x, pt.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     int visible = (int)items_.size();
     if (visible > kCandMaxVisible) visible = kCandMaxVisible;
-    int h = visible * LineHeight() + kCandPad * 2;
-    int w = kCandWidth;
+    int h = visible * LineHeight() + Scale(kCandPad) * 2;
+    int w = Scale(kCandWidth);
     // 画面外にはみ出す場合は上に出す
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfo(mon, &mi);
-    int x = pt.x, y = pt.y + 4;
-    if (y + h > mi.rcWork.bottom) y = pt.y - h - 28;
+    int x = pt.x, y = pt.y + Scale(4);
+    if (y + h > mi.rcWork.bottom) y = pt.y - h - Scale(28);
     if (x + w > mi.rcWork.right) x = mi.rcWork.right - w;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
     SetWindowPos(hwnd_, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     if (!dwmRounded_)
-        SetWindowRgn(hwnd_, CreateRoundRectRgn(0, 0, w + 1, h + 1, 12, 12), TRUE);
+        SetWindowRgn(hwnd_, CreateRoundRectRgn(0, 0, w + 1, h + 1,
+                                             Scale(12), Scale(12)), TRUE);
     InvalidateRect(hwnd_, nullptr, TRUE);
 }
 
@@ -356,29 +368,30 @@ void CCandidateWindow::Paint(HDC hdc) {
         g.DrawImage(image_, Gdiplus::Rect(0, 0, rc.right, rc.bottom));
     }
     const int lineH = LineHeight();
-    HFONT font = CreateFontW(-fontSize_, 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+    HFONT font = CreateFontW(-Scale(fontSize_), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
                              FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH, fontName_.c_str());
-    HFONT numFont = CreateFontW(-(fontSize_ - 3), 0, 0, 0, FW_NORMAL, FALSE,
+    HFONT numFont = CreateFontW(-Scale(fontSize_ - 3), 0, 0, 0, FW_NORMAL, FALSE,
                                 FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                 CLEARTYPE_QUALITY, DEFAULT_PITCH,
                                 L"Segoe UI");
     HGDIOBJ oldFont = SelectObject(hdc, font);
     SetBkMode(hdc, TRANSPARENT);
-    int y = kCandPad;
+    const int pad = Scale(kCandPad);
+    int y = pad;
     for (int i = scrollTop_;
          i < (int)items_.size() && i < scrollTop_ + kCandMaxVisible; i++) {
-        RECT line = {kCandPad, y, rc.right - kCandPad, y + lineH};
+        RECT line = {pad, y, rc.right - pad, y + lineH};
         if (i == sel_) {
             // 角丸のアクセント色ハイライト
             HBRUSH selBrush = CreateSolidBrush(selColor_);
-            HPEN selPen = CreatePen(PS_SOLID, 1, selColor_);
+            HPEN selPen = CreatePen(PS_SOLID, Scale(1), selColor_);
             HGDIOBJ ob = SelectObject(hdc, selBrush);
             HGDIOBJ op = SelectObject(hdc, selPen);
-            RoundRect(hdc, line.left, line.top + 1, line.right, line.bottom - 1,
-                      8, 8);
+            RoundRect(hdc, line.left, line.top + Scale(1), line.right,
+                      line.bottom - Scale(1), Scale(8), Scale(8));
             SelectObject(hdc, ob);
             SelectObject(hdc, op);
             DeleteObject(selBrush);
@@ -388,13 +401,13 @@ void CCandidateWindow::Paint(HDC hdc) {
         wchar_t num[8];
         wsprintfW(num, L"%d", (i % 9) + 1);
         RECT nr = line;
-        nr.left += 8;
+        nr.left += Scale(8);
         SelectObject(hdc, numFont);
         SetTextColor(hdc, i == sel_ ? RGB(200, 222, 245) : RGB(150, 150, 150));
         DrawTextW(hdc, num, -1, &nr, DT_SINGLELINE | DT_VCENTER);
         // 候補本体
         RECT tr = line;
-        tr.left += 26;
+        tr.left += Scale(26);
         SelectObject(hdc, font);
         SetTextColor(hdc, i == sel_ ? RGB(255, 255, 255) : textColor_);
         DrawTextW(hdc, items_[i].c_str(), (int)items_[i].size(), &tr,
@@ -811,6 +824,7 @@ void CTextService::ReloadSettings() {
     // 入力設定
     if (session_) {
         session_->SetFullWidthSymbols(readDword(L"FullWidthSymbols", 1) != 0);
+        session_->SetAutoCommitPunctuation(readDword(L"AutoCommitPunctuation", 1) != 0);
         session_->SetLatexMode((int)readDword(L"LatexMode", 1));
     }
 }

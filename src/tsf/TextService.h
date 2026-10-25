@@ -43,6 +43,7 @@ public:
 private:
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
     void Paint(HDC hdc);
+    int Scale(int value) const;
     int LineHeight() const;
     HWND hwnd_ = nullptr;
     std::vector<std::wstring> items_;
@@ -50,7 +51,7 @@ private:
     int scrollTop_ = 0;
     bool dwmRounded_ = false;
     std::wstring fontName_ = L"Meiryo UI";
-    int fontSize_ = 15;
+    int fontSize_ = 15;  // 96 DPI logical pixels
     COLORREF bgColor_ = RGB(255, 255, 255);
     COLORREF textColor_ = RGB(32, 32, 32);
     COLORREF selColor_ = RGB(0, 103, 192);
